@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CanvasGl</title>
+</head>
+
+<body>
+    <canvas id="canvas" width="800" height="600"></canvas>
+
+    <script src="./lib.js"></script>
+    <script>
+        const canvas = document.getElementById("canvas");
+        if (!canvas) {
+            throw new Error("Canvas element not found");
+        }
+
+        /** @type {CanvasRenderingContext2D} */
+        const ctx = canvas.getContext("2d");
+
+        const width = canvas.width;
+        const height = canvas.height;
+
+        const image = ctx.createImageData(width, height);
+        const pixels = image.data;
+        const drawContext = new DrawContext(image);
+
+        /** @type {Vec3[]} */
+        const cubeVertices = [
+            [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+            [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1],
+        ];
+
+        /** @type {Color[]} */
+        const cubeColors = cubeVertices.map(v => [(v[0] + 1) / 2, (v[1] + 1) / 2, (v[2] + 1) / 2, 1]);
+
+        const cubeIndices = [
+            0, 1, 2, 0, 2, 3, // 手前
+            5, 4, 7, 5, 7, 6, // 奥
+            4, 0, 3, 4, 3, 7, // 左
+            1, 5, 6, 1, 6, 2, // 右
+            3, 2, 6, 3, 6, 7, // 上
+            4, 5, 1, 4, 1, 0, // 下
+        ];
+
+
+
+        /**
+         * @param {number} time 
+         * @param {Color} c0 
+         * @param {Color} c1 
+         * @param {Color} c2 
+         * @returns {Shader} 
+         */
+        const makeShader = (time, c0, c1, c2) => {
+            const scale = Math.min(width, height) / 2;
+
+            return {
+                vertexShader: (v) => {
+                    const zOffset = 5;
+                    const rotated = rotateY(rotateX(v, time), time);
+                    const translated = translateZ(rotated, zOffset);
+                    const projected = project(translated);
+                    return [
+                        projected[0] * scale + width / 2,
+                        -projected[1] * scale + height / 2,
+                        projected[2],
+                    ];
+                },
+                fragmentShader: ([a, b, g]) => [
+                    a * c0[0] + b * c1[0] + g * c2[0],
+                    a * c0[1] + b * c1[1] + g * c2[1],
+                    a * c0[2] + b * c1[2] + g * c2[2],
+                    1,
+                ],
+            };
+        };
+
+
+
+        function update(time) {
+            const t = time / 1000;
+
+            drawContext.clear([24 / 255, 24 / 255, 32 / 255, 1]);
+
+            for (let i = 0; i < cubeIndices.length; i += 3) {
+                const i0 = cubeIndices[i];
+                const i1 = cubeIndices[i + 1];
+                const i2 = cubeIndices[i + 2];
+
+                const shader = makeShader(t, cubeColors[i0], cubeColors[i1], cubeColors[i2]);
+                drawContext.drawTriangle(shader, cubeVertices[i0], cubeVertices[i1], cubeVertices[i2]);
+            }
+
+            drawContext.put(ctx);
+            requestAnimationFrame(update);
+        }
+        requestAnimationFrame(update);
+    </script>
+</body>
+
+</html>

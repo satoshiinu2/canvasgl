@@ -1,0 +1,212 @@
+
+/** 
+ * @typedef {[number, number]} Vec2 - 2Dベクトルを表す配列
+ * @property {number} 0 - x成分
+ * @property {number} 1 - y成分
+ */
+
+/** 
+ * @typedef {[number, number, number]} Vec3 - 3Dベクトルを表す配列
+ * @property {number} 0 - x成分
+ * @property {number} 1 - y成分
+ * @property {number} 2 - z成分
+ */
+
+/**
+ * @typedef {[number, number, number, number]} Vec4 - 4Dベクトルを表す配列
+ * @property {number} 0 - x成分
+ * @property {number} 1 - y成分
+ * @property {number} 2 - z成分
+ * @property {number} 3 - w成分
+ */
+
+/**
+ * @typedef {[number, number, number, number]} Color - RGBAカラーを表す配列
+ * @property {number} 0 - 赤成分 (0.0 - 1.0)
+ * @property {number} 1 - 緑成分 (0.0 - 1.0)
+ * @property {number} 2 - 青成分 (0.0 - 1.0)
+ * @property {number} 3 - アルファ成分 (0.0 - 1.0)
+ */
+
+/**
+ * @typedef {Object} Shader
+ * @property {function(Vec3): Vec2]} vertexShader - 頂点シェーダー関数
+ * @property {function([number, number, number]): Color} fragmentShader - フラグメントシェーダー関数
+ */
+
+/**
+ * @param {Vec3} a - 3Dベクトル
+ * @returns {Vec3} - プロジェクション後の2Dベクトルとz成分を含む配列
+ */
+function project(a) {
+    const z = a[2];
+    if (Math.abs(z) < Number.EPSILON) {
+        return [0, 0, z];
+    }
+    return [a[0] / z, a[1] / z, z];
+}
+
+/**
+ * @param {Vec3} a - 3Dベクトル
+ * @param {number} t - 回転角度（ラジアン）
+ * @returns {Vec3} - X軸回転後の3Dベクトル
+ */
+function rotateX(a, t) {
+    const c = Math.cos(t), s = Math.sin(t);
+    return [a[0], a[1] * c - a[2] * s, a[1] * s + a[2] * c];
+}
+
+/**
+ * @param {Vec3} a - 3Dベクトル
+ * @param {number} t - 回転角度（ラジアン）
+ * @returns {Vec3} - Y軸回転後の3Dベクトル
+ */
+function rotateY(a, t) {
+    const c = Math.cos(t), s = Math.sin(t);
+    return [a[0] * c + a[2] * s, a[1], -a[0] * s + a[2] * c];
+}
+
+/**
+ * @param {Vec3} a - 3Dベクトル
+ * @param {number} t - 回転角度（ラジアン）
+ * @returns {Vec3} - Z軸回転後の3Dベクトル
+ */
+function rotateZ(a, t) {
+    const c = Math.cos(t), s = Math.sin(t);
+    return [a[0] * c - a[1] * s, a[0] * s + a[1] * c, a[2]];
+}
+
+/**
+ * @param {Vec3} a - 3Dベクトル
+ * @param {number} x - X方向の平行移動量
+ * @returns {Vec3} - X方向に平行移動後の3Dベクトル
+ */
+function translateX(a, x) {
+    return [a[0] + x, a[1], a[2]];
+}
+
+/**
+ * @param {Vec3} a - 3Dベクトル
+ * @param {number} y - Y方向の平行移動量
+ * @returns {Vec3} - Y方向に平行移動後の3Dベクトル
+ */
+function translateY(a, y) {
+    return [a[0], a[1] + y, a[2]];
+}
+
+/**
+ * @param {Vec3} a - 3Dベクトル
+ * @param {number} z - Z方向の平行移動量
+ * @returns {Vec3} - Z方向に平行移動後の3Dベクトル
+ */
+function translateZ(a, z) {
+    return [a[0], a[1], a[2] + z];
+}
+
+
+/**
+ * 計算された三角形の符号付き面積を返す関数
+ * @param {number} x1 
+ * @param {number} y1 
+ * @param {number} x2 
+ * @param {number} y2 
+ * @param {number} x3 
+ * @param {number} y3 
+ * @returns {number}  
+ */
+function signedTriangleArea(x1, y1, x2, y2, x3, y3) {
+    return ((x2 - x1) * (y3 - y1) - (x3 - x1) * (y2 - y1)) / 2;
+}
+
+
+class DrawContext {
+
+    /**
+     * @param {ImageData} image
+     */
+    constructor(image) {
+        this.image = image;
+        this.depth = new Float32Array(image.width * image.height);
+    }
+
+    /**
+     * Draws a triangle on the image using the provided shader.
+     * @param {Shader} shader - The shader to use for drawing.
+     * @param {Vec3} v0 - The first vertex of the triangle.
+     * @param {Vec3} v1 - The second vertex of the triangle.
+     * @param {Vec3} v2 - The third vertex of the triangle.
+     */
+    drawTriangle(shader, v0, v1, v2) {
+        const pixels = this.image.data;
+
+        const [x1, y1, z1] = shader.vertexShader(v0);
+        const [x2, y2, z2] = shader.vertexShader(v1);
+        const [x3, y3, z3] = shader.vertexShader(v2);
+
+        const minX = Math.max(0, Math.floor(Math.min(x1, x2, x3)));
+        const maxX = Math.min(this.image.width - 1, Math.ceil(Math.max(x1, x2, x3)));
+        const minY = Math.max(0, Math.floor(Math.min(y1, y2, y3)));
+        const maxY = Math.min(this.image.height - 1, Math.ceil(Math.max(y1, y2, y3)));
+        const area = signedTriangleArea(x1, y1, x2, y2, x3, y3);
+        if (area === 0) {
+            return; // Degenerate triangle, do nothing
+        }
+
+        const iz1 = z1 === 0 ? Number.MAX_VALUE : 1 / z1;
+        const iz2 = z2 === 0 ? Number.MAX_VALUE : 1 / z2;
+        const iz3 = z3 === 0 ? Number.MAX_VALUE : 1 / z3;
+
+        for (let y = minY; y <= maxY; y++) {
+            for (let x = minX; x <= maxX; x++) {
+                const areaA = signedTriangleArea(x, y, x2, y2, x3, y3) / area;
+                const areaB = signedTriangleArea(x1, y1, x, y, x3, y3) / area;
+                const areaG = signedTriangleArea(x1, y1, x2, y2, x, y) / area;
+
+                if (areaA < 0 || areaB < 0 || areaG < 0) {
+                    continue; // outside
+                }
+
+                const invZ = areaA * iz1 + areaB * iz2 + areaG * iz3;
+                if (invZ <= this.depthGet(x, y)) continue; // 奥にある
+                this.depthSet(x, y, invZ);
+
+                const index = (y * this.image.width + x) * 4;
+
+                const color = shader.fragmentShader([areaA, areaB, areaG]);
+
+                pixels[index] = color[0] * 255; // R
+                pixels[index + 1] = color[1] * 255; // G
+                pixels[index + 2] = color[2] * 255; // B
+                pixels[index + 3] = color[3] * 255; // A
+            }
+        }
+
+    }
+
+    depthGet(x, y) {
+        const index = y * this.image.width + x;
+        return this.depth[index];
+    }
+
+    depthSet(x, y, value) {
+        const index = y * this.image.width + x;
+        this.depth[index] = value;
+    }
+
+
+    clear(color) {
+        const p = this.image.data;
+        for (let i = 0; i < p.length; i += 4) {
+            p[i] = color[0] * 255;
+            p[i + 1] = color[1] * 255;
+            p[i + 2] = color[2] * 255;
+            p[i + 3] = color[3] * 255;
+        }
+        this.depth.fill(0); // 1/z を保持するので 0 = 無限遠
+    }
+
+
+    put(ctx) {
+        ctx.putImageData(this.image, 0, 0);
+    }
+}
