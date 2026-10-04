@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CanvasGl Minecraft</title>
+    <style>
+        html,
+        body {
+            margin: 0;
+            height: 100%;
+            background: #000;
+            overflow: hidden;
+        }
+
+        body {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        canvas {
+            width: min(100vw, 160vh);
+            aspect-ratio: 8 / 5;
+            image-rendering: pixelated;
+            cursor: crosshair;
+        }
+
+        #info {
+            position: fixed;
+            left: 8px;
+            top: 8px;
+            color: #fff;
+            font: 12px/1.5 monospace;
+            text-shadow: 1px 1px 0 #000;
+            pointer-events: none;
+            white-space: pre;
+        }
+
+        #start {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #fff;
+            font: 16px/1.8 monospace;
+            text-align: center;
+            background: rgba(0, 0, 0, .55);
+            pointer-events: none;
+            white-space: pre;
+        }
+    </style>
+</head>
+
+<body>
+    <canvas id="canvas" width="320" height="200"></canvas>
+    <div id="info"></div>
+    <div id="start">クリックで開始
+
+        WASD: 移動 Space: ジャンプ Shift: ダッシュ
+        左クリック: 壊す 右クリック: 置く
+        1-8 / ホイール: ブロック選択
+        F: 飛行(Space上昇 / Shift下降) [ ]: 描画距離</div>
+
+    <script src="./lib2.js"></script>
+    <script>
+        // ============================================================
+        //  セットアップ (lib.js の DrawContext だけで描画する)
+        // ============================================================
+        const canvas = document.getElementById("canvas");
+        if (!canvas) throw new Error("Canvas element not found");
+        /** @type {CanvasRenderingContext2D} */
+        const ctx = canvas.getContext("2d");
+        const W = canvas.width;
+        const H = canvas.height;
+
+        const image = ctx.createImageData(W, H);
+        const drawContext = new DrawContext(image);
+
+        const FOV = 60 * Math.PI / 180;
+        const FOCAL = (H / 2) / Math.tan(FOV / 2);
+        const TAN_X = (W / 2) / FOCAL;
+        const TAN_Y = (H / 2) / FOCAL;
+        const NEAR = 0.1;
+        const SKY = [0.53, 0.74, 0.95];
+
+        let renderDistance = 40;
+
+        // ============================================================
+        //  ブロック定義 / ワールド
+        // ============================================================
+        const AIR = 0, GRASS = 1, DIRT = 2, STONE = 3, SAND = 4, LOG = 5, LEAVES = 6, PLANKS = 7, COBBLE = 8, WATER = 9;
+        const SEA = 14; // 水面の最上段ブロックのy
+        const HOTBAR = [GRASS, DIRT, STONE, SAND, LOG, LEAVES, PLANKS, COBBLE];
+
+        const WX = 96, WZ = 96, WY = 40;
+        const CS = 16;                  // チャンク幅
+        const CW = WX / CS, CD = WZ / CS;
+        const blocks = new Uint8Array(WX * WY * WZ);
+
+        const idx = (x, y, z) => (y * WZ + z) * WX + x;
+        const inBounds = (x, y, z) => x >= 0 && x < WX && y >= 0 && y < WY && z >= 0 && z < WZ;
+        const getBlock = (x, y, z) => inBounds(x, y, z) ? blocks[idx(x, y, z)] : AIR;
+
+        // 衝突判定: 範囲外の側面と床は壁、上空は空気
+        function solidForCollision(x, y, z) {
+            if (y < 0) return true;
+            if (y >= WY) return false;
+            if (x < 0 || x >= WX || z < 0 || z >= WZ) return true;
+            const t = blocks[idx(x, y, z)];
+            return t !== AIR && t !== WATER;
+        }
+        // 描画用: 隣の面を隠すブロックか。空気・葉(穴あき)・水は隠さない。
+        // 床下は塞ぐ(描かない)が、側面の範囲外は空気扱いで断面を見せる
+        function occludes(x, y, z) {
+            if (y < 0) return true;
+            if (y >= WY) return false;
+            if (x < 0 || x >= WX || z < 0 || z >= WZ) return false;
+            const t = blocks[idx(x, y, z)];
+            return t !== AIR && t !== LEAVES && t !== WATER;
+        }
+
+        // ---------- ハッシュ / ノイズ ----------
+        function hash(x, y, s) {
+            let h = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(s, 2246822519)) | 0;
+            h = Math.imul(h ^ (h >>> 13), 1274126177);
+            h ^= h >>> 16;
+            return (h >>> 0) / 4294967296;
+        }
+        function vnoise(x, z, s) {
+            const xi = Math.floor(x), zi = Math.floor(z);
+            const fx = x - xi, fz = z - zi;
+            const u = fx * fx * (3 - 2 * fx), v = fz * fz * (3 - 2 * fz);
+            const a = hash(xi, zi, s), b = hash(xi + 1, zi, s);
+            const c = hash(xi, zi + 1, s), d = hash(xi + 1, zi + 1, s);
+            return (a + (b - a) * u) * (1 - v) + (c + (d - c) * u) * v;
+        }
+        function heightAt(x, z) {
+            const n = 0.55 * vnoise(x / 40, z / 40, 100) + 0.3 * vnoise(x / 18, z / 18, 101) + 0.15 * vnoise(x / 8, z / 8, 102);
+            return 8 + Math.floor(n * 20);
+        }
+
+        function generateWorld() {
+            const heights = new Int32Array(WX * WZ);
+            for (let z = 0; z < WZ; z++) {
+                for (let x = 0; x < WX; x++) {
+                    const h = heightAt(x, z);
+                    heights[z * WX + x] = h;
+                    const beach = h <= SEA + 1;
+                    for (let y = 0; y <= h; y++) {
+                        let t;
+                        if (y === h) t = beach ? SAND : GRASS;
+                        else if (y >= h - 3) t = beach ? SAND : DIRT;
+                        else t = STONE;
+                        blocks[idx(x, y, z)] = t;
+                    }
+                    for (let y = h + 1; y <= SEA; y++) blocks[idx(x, y, z)] = WATER;
+                }
+            }
+            // 木
+            for (let z = 4; z < WZ - 4; z++) {
+                for (let x = 4; x < WX - 4; x++) {
+                    const h = heights[z * WX + x];
+                    if (blocks[idx(x, h, z)] !== GRASS) continue;
+                    if (hash(x, z, 200) > 0.012) continue;
+                    const th = 4 + ((hash(x, z, 201) * 3) | 0);
+                    for (let dy = th - 2; dy <= th + 1; dy++) {
+                        const r = dy >= th ? 1 : 2;
+                        for (let dz = -r; dz <= r; dz++) {
+                            for (let dx = -r; dx <= r; dx++) {
+                                if (Math.abs(dx) === 2 && Math.abs(dz) === 2 && hash(x + dx, z + dz + dy, 202) < 0.5) continue;
+                                const yy = h + dy;
+                                if (yy < WY && blocks[idx(x + dx, yy, z + dz)] === AIR) blocks[idx(x + dx, yy, z + dz)] = LEAVES;
+                            }
+                        }
+                    }
+                    for (let dy = 1; dy <= th; dy++) blocks[idx(x, h + dy, z)] = LOG;
+                }
+            }
+        }
+        generateWorld();
+
+        // ============================================================
+        //  チャンクメッシュ (露出面のリスト)
+        // ============================================================
+        // dir: 0:+x 1:-x 2:+y 3:-y 4:+z 5:-z
+        const NX = [1, -1, 0, 0, 0, 0];
+        const NY = [0, 0, 1, -1, 0, 0];
+        const NZ = [0, 0, 0, 0, 1, -1];
+        const OX = [1, 0, 0, 0, 0, 0];
+        const OY = [0, 0, 1, 0, 0, 0];
+        const OZ = [0, 0, 0, 0, 1, 0];
+        const SHADE = [0.8, 0.8, 1.0, 0.5, 0.65, 0.65];
+
+        // 各面の4頂点: [x, y, z, u, v]   (側面は v=0 が上)
+        const FACE = [
+            [[1, 1, 0, 0, 0], [1, 1, 1, 1, 0], [1, 0, 1, 1, 1], [1, 0, 0, 0, 1]],
+            [[0, 1, 1, 0, 0], [0, 1, 0, 1, 0], [0, 0, 0, 1, 1], [0, 0, 1, 0, 1]],
+            [[0, 1, 0, 0, 0], [1, 1, 0, 1, 0], [1, 1, 1, 1, 1], [0, 1, 1, 0, 1]],
+            [[0, 0, 1, 0, 0], [1, 0, 1, 1, 0], [1, 0, 0, 1, 1], [0, 0, 0, 0, 1]],
+            [[1, 1, 1, 0, 0], [0, 1, 1, 1, 0], [0, 0, 1, 1, 1], [1, 0, 1, 0, 1]],
+            [[0, 1, 0, 0, 0], [1, 1, 0, 1, 0], [1, 0, 0, 1, 1], [0, 0, 0, 0, 1]],
+        ];
+
+        const chunks = [];
+        for (let cz = 0; cz < CD; cz++) {
+            for (let cx = 0; cx < CW; cx++) {
+                chunks.push({ cx, cz, faces: new Int32Array(0), tfaces: new Int32Array(0), dirty: true, dist: 0 });
+            }
+        }
+
+        function rebuildChunk(ch) {
+            const out = [], tout = [];
+            const x0 = ch.cx * CS, z0 = ch.cz * CS;
+            for (let y = 0; y < WY; y++) {
+                for (let z = z0; z < z0 + CS; z++) {
+                    for (let x = x0; x < x0 + CS; x++) {
+                        const t = blocks[idx(x, y, z)];
+                        if (t === AIR) continue;
+                        for (let d = 0; d < 6; d++) {
+                            const nx = x + NX[d], ny = y + NY[d], nz = z + NZ[d];
+                            if (t === WATER) {
+                                // 水: 隣が水・不透明ブロックなら描かない。半透明リストへ
+                                if (getBlock(nx, ny, nz) === WATER || occludes(nx, ny, nz)) continue;
+                                tout.push(x, y, z, d, t);
+                            } else if (!occludes(nx, ny, nz)) {
+                                out.push(x, y, z, d, t);
+                            }
+                        }
+                    }
+                }
+            }
+            ch.faces = Int32Array.from(out);
+            ch.tfaces = Int32Array.from(tout);
+            ch.dirty = false;
+        }
+
+        function markDirty(x, z) {
+            const cx = Math.floor(x / CS), cz = Math.floor(z / CS);
+            const touch = (a, b) => { if (a >= 0 && a < CW && b >= 0 && b < CD) chunks[b * CW + a].dirty = true; };
+            touch(cx, cz);
+            if (x % CS === 0) touch(cx - 1, cz);
+            if (x % CS === CS - 1) touch(cx + 1, cz);
+            if (z % CS === 0) touch(cx, cz - 1);
+            if (z % CS === CS - 1) touch(cx, cz + 1);
+        }
+
+        // ============================================================
+        //  テクスチャ (すべて手続き的。フラグメントシェーダー内で生成)
+        // ============================================================
+        const T = new Float32Array(3); // 出力 RGB (0..1)
+        let TA = 1;                    // 出力 alpha (0 = 破棄)
+        let gameTime = 0;              // 水のアニメーション用 (秒)
+        function setc(r, g, b, m) {
+            TA = 1;
+            T[0] = r * m / 255;
+            T[1] = g * m / 255;
+            T[2] = b * m / 255;
+        }
+        function dirtTex(x, y) {
+            let m = 0.75 + 0.35 * hash(x, y, 2);
+            if (hash(x, y, 5) > 0.9) m *= 0.7;
+            setc(134, 96, 67, m);
+        }
+
+        /** 16x16 テクセル (x, y) の色を T に書き込む。dir: 2=上, 3=下, それ以外=側面 */
+        function sampleTexture(type, dir, x, y) {
+            const side = dir !== 2 && dir !== 3;
+            switch (type) {
+                case GRASS:
+                    if (dir === 2) {
+                        setc(95, 159, 53, 0.78 + 0.4 * hash(x, y, 1));
+                    } else if (dir === 3) {
+                        dirtTex(x, y);
+                    } else {
+                        const edge = 2 + ((hash(x, 9, 3) * 3) | 0);
+                        if (y < edge) setc(95, 159, 53, 0.7 + 0.4 * hash(x, y, 1));
+                        else dirtTex(x, y);
+                    }
+                    break;
+                case DIRT:
+                    dirtTex(x, y);
+                    break;
+                case STONE: {
+                    const m = 0.78 + 0.18 * hash(x >> 1, y >> 1, 3) + 0.12 * hash(x, y, 4);
+                    setc(125, 125, 128, m);
+                    break;
+                }
+                case SAND: {
+                    let m = 0.92 + 0.12 * hash(x, y, 6);
+                    if (hash(x, y, 7) > 0.93) m *= 0.88;
+                    setc(222, 208, 148, m);
+                    break;
+                }
+                case LOG:
+                    if (!side) {
+                        const d = Math.max(Math.abs(x - 7.5), Math.abs(y - 7.5));
+                        if (d > 6.6) {
+                            setc(103, 80, 50, 0.6 + 0.5 * hash(x, y, 10));
+                        } else {
+                            const ring = (d | 0) & 1 ? 1.0 : 0.85;
+                            setc(172, 138, 84, ring * (0.95 + 0.1 * hash(x, y, 11)));
+                        }
+                    } else {
+                        const n = 0.5 * hash(x, 0, 8) + 0.3 * hash(x, y >> 2, 9) + 0.2 * hash(x, y, 10);
+                        setc(103, 80, 50, 0.55 + 0.6 * n);
+                    }
+                    break;
+                case LEAVES: {
+                    const n = hash(x, y, 12);
+                    setc(52, 128, 38, 0.55 + 0.7 * n);
+                    if (hash(x, y, 16) < 0.18) TA = 0; // 穴あき (フラグメント破棄)
+                    break;
+                }
+                case WATER: {
+                    const wave = Math.sin((x + y * 1.3) * 0.7 + gameTime * 2.5) * 0.5 + 0.5;
+                    const spark = hash(x, y, (gameTime * 3) | 0);
+                    setc(45, 95, 215, 0.85 + 0.15 * wave + (spark > 0.96 ? 0.35 : 0));
+                    TA = 0.62;
+                    break;
+                }
+                case PLANKS: {
+                    const row = y >> 2;
+                    const sx = (x + (row & 1) * 8) & 15;
+                    let m = 0.95 + 0.15 * hash(x, y, 13);
+                    if ((y & 3) === 3) m *= 0.75;
+                    else if (sx === 0) m *= 0.8;
+                    setc(180, 144, 90, m);
+                    break;
+                }
+                case COBBLE: {
+                    const row = y >> 2;
+                    const ox = x + (row & 1) * 2;
+                    let m = 0.6 + 0.5 * hash(ox >> 2, row, 14);
+                    m *= 0.9 + 0.1 * hash(x, y, 15);
+                    if ((y & 3) === 0 || (ox & 3) === 0) m *= 0.65;
+                    setc(128, 128, 128, m);
+                    break;
+                }
+                default:
+                    setc(255, 0, 255, 1);
+            }
+        }
+
+        // ============================================================
+        //  シェーダー (三角形ごとに生成)
+        // ============================================================
+        /**
+         * @param {number[]} p0 ビュー空間頂点 [x,y,z,u,v]
+         * @param {number[]} p1
+         * @param {number[]} p2
+         * @param {number} type ブロック種別
+         * @param {number} dir 面の向き
+         * @param {boolean} hl 照準中のブロックか
+         * @returns {Shader}
+         */
+        function makeShader(p0, p1, p2, type, dir, hl) {
+            // 頂点は [x, y, z, u, v] (ビュー空間)。クリップ・透視補正は lib.js に任せる
+            const u0 = p0[3], u1 = p1[3], u2 = p2[3];
+            const v0 = p0[4], v1 = p1[4], v2 = p2[4];
+            const shade = SHADE[dir] * (hl ? 1.18 : 1);
+            const fogStart = renderDistance * 0.6;
+            const fogRange = renderDistance * 0.38;
+
+            return {
+                vertexShader: (v) => viewToClip(v, FOCAL, W, H),
+                fragmentShader: (bary, z) => {
+                    // bary は透視補正済み、z はそのピクセルのビュー空間の奥行き
+                    const u = bary[0] * u0 + bary[1] * u1 + bary[2] * u2;
+                    const v = bary[0] * v0 + bary[1] * v1 + bary[2] * v2;
+
+                    let tx = (u * 16) | 0, ty = (v * 16) | 0;
+                    tx = tx < 0 ? 0 : tx > 15 ? 15 : tx;
+                    ty = ty < 0 ? 0 : ty > 15 ? 15 : ty;
+                    sampleTexture(type, dir, tx, ty);
+                    if (TA <= 0) return null; // 穴あき部分は破棄
+
+                    let r = T[0] * shade, g = T[1] * shade, b = T[2] * shade;
+
+                    if (hl && (u < 0.04 || u > 0.96 || v < 0.04 || v > 0.96)) {
+                        r *= 0.15; g *= 0.15; b *= 0.15; // 照準ブロックの輪郭
+                    }
+
+                    let f = (z - fogStart) / fogRange;
+                    f = f < 0 ? 0 : f > 1 ? 1 : f;
+                    return [
+                        r + (SKY[0] - r) * f,
+                        g + (SKY[1] - g) * f,
+                        b + (SKY[2] - b) * f,
+                        TA,
+                    ];
+                },
+            };
+        }
+
+        // ============================================================
+        //  プレイヤー / 入力
+        // ============================================================
+        const player = { x: WX / 2 + 0.5, y: 0, z: WZ / 2 + 0.5, vx: 0, vy: 0, vz: 0, yaw: 0, pitch: 0, onGround: false, fly: false };
+        (function spawn() {
+            const x = Math.floor(player.x), z = Math.floor(player.z);
+            for (let y = WY - 1; y >= 0; y--) {
+                const t = blocks[idx(x, y, z)];
+                if (t !== AIR && t !== LEAVES && t !== LOG) { player.y = y + 1.01; break; }
+            }
+        })();
+
+        const HALF = 0.3, HEIGHT = 1.8, EYE = 1.62;
+        function collides(px, py, pz) {
+            const x0 = Math.floor(px - HALF), x1 = Math.floor(px + HALF - 1e-6);
+            const y0 = Math.floor(py), y1 = Math.floor(py + HEIGHT - 1e-6);
+            const z0 = Math.floor(pz - HALF), z1 = Math.floor(pz + HALF - 1e-6);
+            for (let y = y0; y <= y1; y++)
+                for (let z = z0; z <= z1; z++)
+                    for (let x = x0; x <= x1; x++)
+                        if (solidForCollision(x, y, z)) return true;
+            return false;
+        }
+
+        const keys = new Set();
+        let selected = 0;
+        let locked = false;
+        const startEl = document.getElementById("start");
+        const infoEl = document.getElementById("info");
+
+        addEventListener("keydown", (e) => {
+            if (e.repeat) return;
+            keys.add(e.code);
+            if (e.code === "Space") e.preventDefault();
+            if (e.code === "KeyF") { player.fly = !player.fly; player.vy = 0; }
+            if (e.code === "BracketLeft") renderDistance = Math.max(16, renderDistance - 8);
+            if (e.code === "BracketRight") renderDistance = Math.min(96, renderDistance + 8);
+            const m = /^Digit([1-8])$/.exec(e.code);
+            if (m) selected = Number(m[1]) - 1;
+        });
+        addEventListener("keyup", (e) => keys.delete(e.code));
+        addEventListener("blur", () => keys.clear());
+        addEventListener("wheel", (e) => {
+            selected = (selected + (e.deltaY > 0 ? 1 : 7)) % 8;
+        }, { passive: true });
+        canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+        document.addEventListener("pointerlockchange", () => {
+            locked = document.pointerLockElement === canvas;
+            startEl.style.display = locked ? "none" : "flex";
+        });
+        addEventListener("mousemove", (e) => {
+            if (!locked) return;
+            player.yaw += e.movementX * 0.0025;
+            player.pitch -= e.movementY * 0.0025;
+            const lim = 89 * Math.PI / 180;
+            player.pitch = Math.max(-lim, Math.min(lim, player.pitch));
+        });
+        canvas.addEventListener("mousedown", (e) => {
+            if (!locked) { canvas.requestPointerLock(); return; }
+            if (!target) return;
+            if (e.button === 0) {
+                blocks[idx(target.x, target.y, target.z)] = AIR;
+                markDirty(target.x, target.z);
+            } else if (e.button === 2) {
+                const px = target.x + target.nx, py = target.y + target.ny, pz = target.z + target.nz;
+                if (!inBounds(px, py, pz)) return;
+                const cur = blocks[idx(px, py, pz)];
+                if (cur !== AIR && cur !== WATER) return;
+                blocks[idx(px, py, pz)] = HOTBAR[selected];
+                if (collides(player.x, player.y, player.z)) { // 自分に埋まるなら取り消し
+                    blocks[idx(px, py, pz)] = cur;
+                    return;
+                }
+                markDirty(px, pz);
+            } else if (e.button === 1) {
+                const t = getBlock(target.x, target.y, target.z);
+                const i = HOTBAR.indexOf(t);
+                if (i >= 0) selected = i;
+            }
+        });
+
+        function lookDir() {
+            const cp = Math.cos(player.pitch);
+            return [Math.sin(player.yaw) * cp, Math.sin(player.pitch), Math.cos(player.yaw) * cp];
+        }
+
+        /** ボクセルDDAによるレイキャスト */
+        function raycast(o, d, maxDist) {
+            let x = Math.floor(o[0]), y = Math.floor(o[1]), z = Math.floor(o[2]);
+            const sx = Math.sign(d[0]), sy = Math.sign(d[1]), sz = Math.sign(d[2]);
+            const tdx = sx !== 0 ? Math.abs(1 / d[0]) : Infinity;
+            const tdy = sy !== 0 ? Math.abs(1 / d[1]) : Infinity;
+            const tdz = sz !== 0 ? Math.abs(1 / d[2]) : Infinity;
+            let tx = sx > 0 ? (x + 1 - o[0]) * tdx : sx < 0 ? (o[0] - x) * tdx : Infinity;
+            let ty = sy > 0 ? (y + 1 - o[1]) * tdy : sy < 0 ? (o[1] - y) * tdy : Infinity;
+            let tz = sz > 0 ? (z + 1 - o[2]) * tdz : sz < 0 ? (o[2] - z) * tdz : Infinity;
+            let nx = 0, ny = 0, nz = 0, t = 0;
+            while (t <= maxDist) {
+                const bt = getBlock(x, y, z);
+                if (bt !== AIR && bt !== WATER) return { x, y, z, nx, ny, nz };
+                if (tx < ty && tx < tz) { x += sx; t = tx; tx += tdx; nx = -sx; ny = 0; nz = 0; }
+                else if (ty < tz) { y += sy; t = ty; ty += tdy; nx = 0; ny = -sy; nz = 0; }
+                else { z += sz; t = tz; tz += tdz; nx = 0; ny = 0; nz = -sz; }
+            }
+            return null;
+        }
+
+        // ============================================================
+        //  更新
+        // ============================================================
+        let target = null;
+
+        function updatePlayer(dt) {
+            const fwd = (keys.has("KeyW") ? 1 : 0) - (keys.has("KeyS") ? 1 : 0);
+            const strafe = (keys.has("KeyD") ? 1 : 0) - (keys.has("KeyA") ? 1 : 0);
+            const sprint = keys.has("ShiftLeft") || keys.has("ShiftRight");
+            const sy = Math.sin(player.yaw), cy = Math.cos(player.yaw);
+
+            let wx = sy * fwd + cy * strafe;
+            let wz = cy * fwd - sy * strafe;
+            const len = Math.hypot(wx, wz);
+            if (len > 0) { wx /= len; wz /= len; }
+
+            const inWater = getBlock(Math.floor(player.x), Math.floor(player.y + 0.4), Math.floor(player.z)) === WATER;
+            const speed = player.fly ? 12 : (inWater ? 2.6 : (sprint ? 6.5 : 4.3));
+            player.vx = wx * speed;
+            player.vz = wz * speed;
+
+            if (player.fly) {
+                player.vy = ((keys.has("Space") ? 1 : 0) - (sprint ? 1 : 0)) * 9;
+            } else if (inWater) {
+                // 水中: ゆっくり沈み、Spaceで浮上
+                player.vy = keys.has("Space") ? 3.8 : Math.max(player.vy - 10 * dt, -2.5);
+            } else {
+                player.vy -= 28 * dt;
+                if (player.vy < -50) player.vy = -50;
+                if (keys.has("Space") && player.onGround) { player.vy = 8.6; player.onGround = false; }
+            }
+
+            // 軸ごとに移動して衝突解決
+            let nx = player.x + player.vx * dt;
+            if (collides(nx, player.y, player.z)) player.vx = 0; else player.x = nx;
+            let nz = player.z + player.vz * dt;
+            if (collides(player.x, player.y, nz)) player.vz = 0; else player.z = nz;
+            let ny = player.y + player.vy * dt;
+            if (collides(player.x, ny, player.z)) {
+                if (player.vy < 0) player.onGround = true;
+                player.vy = 0;
+            } else {
+                player.y = ny;
+                player.onGround = false;
+            }
+        }
+
+        // ============================================================
+        //  描画
+        // ============================================================
+        /** 面リストを描く。near-clip と透視補正は lib.js 側 */
+        function drawFaces(faces, ex, ey, ez, rd2, hit) {
+            let drawn = 0;
+            for (let i = 0; i < faces.length; i += 5) {
+                const x = faces[i], y = faces[i + 1], z = faces[i + 2], d = faces[i + 3], type = faces[i + 4];
+
+                const dx = x + 0.5 - ex, dy = y + 0.5 - ey, dz = z + 0.5 - ez;
+                if (dx * dx + dy * dy + dz * dz > rd2) continue;
+
+                // 背面カリング
+                const dot = NX[d] * (x + OX[d] - ex) + NY[d] * (y + OY[d] - ey) + NZ[d] * (z + OZ[d] - ez);
+                if (dot >= 0) continue;
+
+                // ビュー空間へ (lib.js の rotateY / rotateX を使用)
+                const fc = FACE[d];
+                const poly = new Array(4);
+                let behind = 0, left = 0, right = 0, up = 0, down = 0;
+                for (let k = 0; k < 4; k++) {
+                    const c = fc[k];
+                    const view = rotateX(rotateY([x + c[0] - ex, y + c[1] - ey, z + c[2] - ez], -player.yaw), player.pitch);
+                    poly[k] = [view[0], view[1], view[2], c[3], c[4]];
+                    if (view[2] < NEAR) behind++;
+                    else {
+                        if (view[0] < -view[2] * TAN_X) left++;
+                        if (view[0] > view[2] * TAN_X) right++;
+                        if (view[1] < -view[2] * TAN_Y) down++;
+                        if (view[1] > view[2] * TAN_Y) up++;
+                    }
+                }
+                if (behind === 4 || left === 4 || right === 4 || up === 4 || down === 4) continue;
+
+                const hl = hit !== null && hit.x === x && hit.y === y && hit.z === z;
+                drawContext.drawTriangle(makeShader(poly[0], poly[1], poly[2], type, d, hl), poly[0], poly[1], poly[2]);
+                drawContext.drawTriangle(makeShader(poly[0], poly[2], poly[3], type, d, hl), poly[0], poly[2], poly[3]);
+                drawn++;
+            }
+            return drawn;
+        }
+
+        function renderWorld() {
+            const ex = player.x, ey = player.y + EYE, ez = player.z;
+            const fwd = lookDir();
+            const rd2 = renderDistance * renderDistance;
+
+            // 可視チャンクを近い順に並べる
+            const vis = [];
+            for (const ch of chunks) {
+                const cx = ch.cx * CS + CS / 2 - ex, cz = ch.cz * CS + CS / 2 - ez;
+                const dist = Math.hypot(cx, cz);
+                if (dist > renderDistance + CS * 1.5) continue;
+                if (cx * fwd[0] + cz * fwd[2] < -CS * 0.9 * Math.hypot(fwd[0], fwd[2]) && dist > CS) continue;
+                if (ch.dirty) rebuildChunk(ch);
+                ch.dist = dist;
+                vis.push(ch);
+            }
+            vis.sort((a, b) => a.dist - b.dist);
+
+            // 1) 不透明 (前→奥。深度テストで奥のシェーダー呼び出しを省く)
+            let drawn = 0;
+            for (let i = 0; i < vis.length; i++) drawn += drawFaces(vis[i].faces, ex, ey, ez, rd2, target);
+            // 2) 半透明 (奥→前。深度は書かないので順序が大事)
+            for (let i = vis.length - 1; i >= 0; i--) drawn += drawFaces(vis[i].tfaces, ex, ey, ez, rd2, null);
+            return drawn;
+        }
+
+        // ---------- HUD (同じ手続きテクスチャを直接ピクセルに書く) ----------
+        function putPixel(x, y, r, g, b) {
+            if (x < 0 || y < 0 || x >= W || y >= H) return;
+            const p = (y * W + x) * 4;
+            const d = image.data;
+            d[p] = r; d[p + 1] = g; d[p + 2] = b; d[p + 3] = 255;
+        }
+        function drawHud() {
+            // 水中の色味
+            if (getBlock(Math.floor(player.x), Math.floor(player.y + EYE), Math.floor(player.z)) === WATER) {
+                const dd = image.data;
+                for (let p = 0; p < dd.length; p += 4) {
+                    dd[p] = dd[p] * 0.6; dd[p + 1] = dd[p + 1] * 0.75 + 20; dd[p + 2] = dd[p + 2] * 0.8 + 60;
+                }
+            }
+            // クロスヘア (反転)
+            const cx = W >> 1, cy = H >> 1, d = image.data;
+            for (let i = -4; i <= 4; i++) {
+                for (const [px, py] of [[cx + i, cy], [cx, cy + i]]) {
+                    if (px < 0 || py < 0 || px >= W || py >= H) continue;
+                    const p = (py * W + px) * 4;
+                    d[p] = 255 - d[p]; d[p + 1] = 255 - d[p + 1]; d[p + 2] = 255 - d[p + 2];
+                }
+            }
+            // ホットバー
+            const slot = 20, gap = 2;
+            const total = HOTBAR.length * (slot + gap) - gap;
+            const x0 = (W - total) >> 1, y0 = H - slot - 4;
+            for (let s = 0; s < HOTBAR.length; s++) {
+                const sx = x0 + s * (slot + gap);
+                const sel = s === selected;
+                for (let j = 0; j < slot; j++) {
+                    for (let i = 0; i < slot; i++) {
+                        const border = i === 0 || j === 0 || i === slot - 1 || j === slot - 1;
+                        if (border) {
+                            if (sel) putPixel(sx + i, y0 + j, 255, 255, 255);
+                            else putPixel(sx + i, y0 + j, 40, 40, 40);
+                        } else {
+                            const tx = Math.min(15, ((i - 1) * 16 / (slot - 2)) | 0);
+                            const ty = Math.min(15, ((j - 1) * 16 / (slot - 2)) | 0);
+                            sampleTexture(HOTBAR[s], 4, tx, ty);
+                            putPixel(sx + i, y0 + j, T[0] * 255, T[1] * 255, T[2] * 255);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ============================================================
+        //  メインループ
+        // ============================================================
+        let last = 0, fpsAcc = 0, fpsFrames = 0, fps = 0;
+
+        function update(time) {
+            const dt = Math.min(0.05, (time - last) / 1000 || 0);
+            last = time;
+            gameTime = time / 1000;
+
+            updatePlayer(dt);
+
+            const eye = [player.x, player.y + EYE, player.z];
+            target = raycast(eye, lookDir(), 6);
+
+            drawContext.clear([SKY[0], SKY[1], SKY[2], 1]);
+            const drawn = renderWorld();
+            drawHud();
+            drawContext.put(ctx);
+
+            fpsAcc += dt; fpsFrames++;
+            if (fpsAcc >= 0.5) {
+                fps = Math.round(fpsFrames / fpsAcc);
+                fpsAcc = 0; fpsFrames = 0;
+                infoEl.textContent =
+                    `FPS ${fps}  faces ${drawn}  dist ${renderDistance}\n` +
+                    `XYZ ${player.x.toFixed(1)} ${player.y.toFixed(1)} ${player.z.toFixed(1)}${player.fly ? "  [FLY]" : ""}`;
+            }
+            requestAnimationFrame(update);
+        }
+        requestAnimationFrame(update);
+    </script>
+</body>
+
+</html>
